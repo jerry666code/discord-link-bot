@@ -109,6 +109,8 @@ async def link(interaction: discord.Interaction):
 
 @bot.tree.command(name="status", description="Проверить статус привязки Discord", guild=GUILD_OBJECT)
 async def status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     async with bot.db_pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
@@ -118,12 +120,12 @@ async def status(interaction: discord.Interaction):
             row = await cur.fetchone()
 
     if row is None:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Discord не привязан к аккаунту на сайте. Используйте /link.", ephemeral=True
         )
         return
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"Привязано к аккаунту #{row['id']} (SteamID {row['steamid']}), с {row['discord_linked_at']}.",
         ephemeral=True,
     )
