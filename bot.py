@@ -31,7 +31,7 @@ GUILD_OBJECT = discord.Object(id=GUILD_ID)
 
 class LinkBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents, status=discord.Status.invisible)
         self.db_pool = None
 
     async def setup_hook(self):
