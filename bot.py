@@ -119,13 +119,19 @@ class LinkBot(commands.Bot):
         await self.tree.sync(guild=GUILD_OBJECT)
         self.sync_roles.start()
 
-        app = web.Application()
-        app.router.add_post("/discord-exchange", handle_discord_exchange)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", PORT)
-        await site.start()
-        log.info("Relay HTTP server listening on port %s", PORT)
+        try:
+            app = web.Application()
+            app.router.add_post("/discord-exchange", handle_discord_exchange)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", PORT)
+            await site.start()
+            log.info("Relay HTTP server listening on port %s", PORT)
+        except OSError as e:
+            # Не даём релею уронить весь бот — /link, /status и синхронизация
+            # ролей с портом не связаны и должны работать даже если релей не
+            # смог стартовать (например, порт уже занят).
+            log.error("Relay HTTP server failed to start on port %s: %s", PORT, e)
 
     async def close(self):
         self.sync_roles.cancel()
