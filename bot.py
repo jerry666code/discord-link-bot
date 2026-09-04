@@ -1,8 +1,11 @@
+import hmac
 import logging
 import os
 
+import aiohttp
 import aiomysql
 import discord
+from aiohttp import web
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
@@ -20,6 +23,14 @@ DB_NAME = os.environ["DB_NAME"]
 DB_USER = os.environ["DB_USER"]
 DB_PASS = os.environ["DB_PASS"]
 
+# Релей для сайта: у сервера сайта заблокирован исходящий доступ к
+# discord.com (подтверждено diag_network.php), поэтому обмен OAuth-кода на
+# токен делается отсюда — этот сервер до discord.com достаёт нормально.
+DISCORD_CLIENT_ID = os.environ["DISCORD_CLIENT_ID"]
+DISCORD_CLIENT_SECRET = os.environ["DISCORD_CLIENT_SECRET"]
+RELAY_SECRET = os.environ["RELAY_SECRET"]
+PORT = int(os.environ.get("PORT", "8080"))
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-bot")
 
@@ -27,6 +38,62 @@ intents = discord.Intents.default()
 intents.members = True
 
 GUILD_OBJECT = discord.Object(id=GUILD_ID)
+
+
+async def handle_discord_exchange(request: web.Request) -> web.Response:
+    if not hmac.compare_digest(request.headers.get("X-Relay-Secret", ""), RELAY_SECRET):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        payload = await request.json()
+    except ValueError:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    code = payload.get("code")
+    redirect_uri = payload.get("redirect_uri")
+    if not code or not redirect_uri:
+        return web.json_response({"ok": False, "error": "missing_code_or_redirect_uri"}, status=400)
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.post(
+                "https://discord.com/api/oauth2/token",
+                data={
+                    "client_id": DISCORD_CLIENT_ID,
+                    "client_secret": DISCORD_CLIENT_SECRET,
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                },
+            ) as token_resp:
+                token_data = await token_resp.json(content_type=None)
+        except aiohttp.ClientError as e:
+            return web.json_response({"ok": False, "error": f"token_request_failed: {e}"}, status=502)
+
+        access_token = token_data.get("access_token")
+        if not access_token:
+            error = token_data.get("error_description") or token_data.get("error") or "token_exchange_failed"
+            return web.json_response({"ok": False, "error": error}, status=502)
+
+        try:
+            async with session.get(
+                "https://discord.com/api/users/@me",
+                headers={"Authorization": f"Bearer {access_token}"},
+            ) as identity_resp:
+                identity = await identity_resp.json(content_type=None)
+        except aiohttp.ClientError as e:
+            return web.json_response({"ok": False, "error": f"identity_request_failed: {e}"}, status=502)
+
+    if not identity.get("id"):
+        return web.json_response({"ok": False, "error": "identity_fetch_failed"}, status=502)
+
+    return web.json_response({
+        "ok": True,
+        "id": identity["id"],
+        "username": identity.get("username", "discord"),
+        "discriminator": identity.get("discriminator", "0"),
+    })
 
 
 class LinkBot(commands.Bot):
@@ -51,6 +118,14 @@ class LinkBot(commands.Bot):
         self.tree.copy_global_to(guild=GUILD_OBJECT)
         await self.tree.sync(guild=GUILD_OBJECT)
         self.sync_roles.start()
+
+        app = web.Application()
+        app.router.add_post("/discord-exchange", handle_discord_exchange)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        log.info("Relay HTTP server listening on port %s", PORT)
 
     async def close(self):
         self.sync_roles.cancel()
