@@ -21,7 +21,10 @@ VERIFIED_ROLE_ID = int(os.environ["VERIFIED_ROLE_ID"])
 LINK_URL = os.environ.get("LINK_URL", "https://www.boberland.ru/api/auth/discord/link")
 # По умолчанию раз в час — под VERIFIED_ROLE_ID и под роли из ROLE_MAPPING_FILE.
 SYNC_INTERVAL_SECONDS = int(os.environ.get("SYNC_INTERVAL_SECONDS", "3600"))
-ROLE_MAPPING_FILE = os.environ.get("ROLE_MAPPING_FILE", "role_mapping.json")
+# Дефолт — рядом с bot.py, а не от текущей рабочей директории процесса: на
+# некоторых хостингах CWD при запуске не совпадает с папкой бота.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROLE_MAPPING_FILE = os.environ.get("ROLE_MAPPING_FILE", os.path.join(BASE_DIR, "role_mapping.json"))
 
 DB_HOST = os.environ["DB_HOST"]
 DB_PORT = int(os.environ.get("DB_PORT", "3306"))
@@ -74,6 +77,11 @@ def load_role_mapping() -> dict:
         with open(ROLE_MAPPING_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
+        log.warning(
+            "%s не найден — роли администратора/VIP синхронизироваться не будут "
+            "(проверьте, что файл загружен на хостинг рядом с bot.py)",
+            ROLE_MAPPING_FILE,
+        )
         return empty
     except (OSError, json.JSONDecodeError) as e:
         log.error("Не удалось прочитать %s: %s", ROLE_MAPPING_FILE, e)
