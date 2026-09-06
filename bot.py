@@ -1,6 +1,8 @@
 import hmac
+import json
 import logging
 import os
+import re
 
 import aiohttp
 import aiomysql
@@ -11,11 +13,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+STEAMID64_BASE = 76561197960265728
+
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 VERIFIED_ROLE_ID = int(os.environ["VERIFIED_ROLE_ID"])
 LINK_URL = os.environ.get("LINK_URL", "https://www.boberland.ru/api/auth/discord/link")
-SYNC_INTERVAL_SECONDS = int(os.environ.get("SYNC_INTERVAL_SECONDS", "60"))
+# По умолчанию раз в час — под VERIFIED_ROLE_ID и под роли из ROLE_MAPPING_FILE.
+SYNC_INTERVAL_SECONDS = int(os.environ.get("SYNC_INTERVAL_SECONDS", "3600"))
+ROLE_MAPPING_FILE = os.environ.get("ROLE_MAPPING_FILE", "role_mapping.json")
 
 DB_HOST = os.environ["DB_HOST"]
 DB_PORT = int(os.environ.get("DB_PORT", "3306"))
@@ -38,6 +44,59 @@ intents = discord.Intents.default()
 intents.members = True
 
 GUILD_OBJECT = discord.Object(id=GUILD_ID)
+
+_STEAM_LEGACY_RE = re.compile(r"^STEAM_[0-5]:([01]):(\d+)$", re.IGNORECASE)
+_STEAM64_RE = re.compile(r"^7656119\d{10}$")
+
+
+def normalize_steamid64(steamid: str):
+    """Порт Services\\SteamIdentity::normalizeTo64 (public/src/Services/SteamIdentity.php) —
+    as_admins.steamid хранится либо как SteamID64, либо как "STEAM_1:Y:Z"."""
+    steamid = (steamid or "").strip()
+    if _STEAM64_RE.match(steamid):
+        return steamid
+    m = _STEAM_LEGACY_RE.match(steamid)
+    if m:
+        return str(STEAMID64_BASE + int(m.group(2)) * 2 + int(m.group(1)))
+    return None
+
+
+def load_role_mapping() -> dict:
+    """Читает ROLE_MAPPING_FILE: {"admin_groups": {"Название AS-группы": "discord_role_id"},
+    "vip_groups": {"group_key": "discord_role_id"}}. Ключи должны совпадать с
+    as_groups.name (Админ-панель → Настройки → Админ-группы, AdminSystem для CS2)
+    и admin_vip_groups.group_key (VIPCore groups.ini) соответственно — файл
+    перечитывается на каждом тике, перезапуск бота не нужен. Значением может быть
+    один ID роли или список ID (["111", "222"]), если группе нужно выдавать
+    сразу несколько ролей в Discord."""
+    empty = {"admin_groups": {}, "vip_groups": {}}
+    try:
+        with open(ROLE_MAPPING_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return empty
+    except (OSError, json.JSONDecodeError) as e:
+        log.error("Не удалось прочитать %s: %s", ROLE_MAPPING_FILE, e)
+        return empty
+
+    def to_role_id_map(section: str) -> dict:
+        result = {}
+        for key, raw_value in (data.get(section) or {}).items():
+            values = raw_value if isinstance(raw_value, list) else [raw_value]
+            role_ids = set()
+            for value in values:
+                try:
+                    role_ids.add(int(value))
+                except (TypeError, ValueError):
+                    log.warning("Некорректный ID роли для %r в %s (%s): %r", key, ROLE_MAPPING_FILE, section, value)
+            if role_ids:
+                result[key] = role_ids
+        return result
+
+    return {
+        "admin_groups": to_role_id_map("admin_groups"),
+        "vip_groups": to_role_id_map("vip_groups"),
+    }
 
 
 async def handle_discord_exchange(request: web.Request) -> web.Response:
@@ -150,13 +209,53 @@ class LinkBot(commands.Bot):
             log.warning("VERIFIED_ROLE_ID %s not found in guild %s", VERIFIED_ROLE_ID, GUILD_ID)
             return
 
+        role_mapping = load_role_mapping()
+        admin_role_map = role_mapping["admin_groups"]
+        vip_role_map = role_mapping["vip_groups"]
+        # Роли, которыми бот управляет сам — их можно снимать, если участник
+        # больше не подпадает ни под один маппинг; остальные роли не трогаем.
+        managed_role_ids = set()
+        for role_ids in admin_role_map.values():
+            managed_role_ids |= role_ids
+        for role_ids in vip_role_map.values():
+            managed_role_ids |= role_ids
+
         async with self.db_pool.acquire() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT discord_id FROM users WHERE discord_id IS NOT NULL")
-                linked_ids = {row[0] for row in await cur.fetchall()}
+                await cur.execute("SELECT discord_id, steamid64 FROM users WHERE discord_id IS NOT NULL")
+                linked_rows = await cur.fetchall()
+
+                admin_groups_by_steamid64 = {}
+                if admin_role_map:
+                    # as_admins.steamid — SteamID64 или "STEAM_1:Y:Z" (заполняется вручную
+                    # в панели или игровым AdminSystem), поэтому нормализуем на стороне бота.
+                    await cur.execute(
+                        "SELECT a.steamid, g.name FROM as_admins a "
+                        "JOIN as_admins_servers s ON s.admin_id = a.id "
+                        "JOIN as_groups g ON g.id = s.group_id "
+                        "WHERE a.steamid != '0' AND (s.expires = 0 OR s.expires > UNIX_TIMESTAMP())"
+                    )
+                    for raw_steamid, group_name in await cur.fetchall():
+                        steamid64 = normalize_steamid64(raw_steamid)
+                        if steamid64:
+                            admin_groups_by_steamid64.setdefault(steamid64, set()).add(group_name)
+
+                vip_groups_by_account_id = {}
+                if vip_role_map:
+                    await cur.execute(
+                        "SELECT account_id, `group` FROM vip_users WHERE expires = 0 OR expires > UNIX_TIMESTAMP()"
+                    )
+                    for account_id, group_key in await cur.fetchall():
+                        vip_groups_by_account_id.setdefault(account_id, set()).add(group_key)
+
+        linked_ids = {str(discord_id) for discord_id, _ in linked_rows}
+        steamid64_by_discord = {
+            str(discord_id): steamid64 for discord_id, steamid64 in linked_rows if steamid64
+        }
 
         for member in guild.members:
-            is_linked = str(member.id) in linked_ids
+            discord_id = str(member.id)
+            is_linked = discord_id in linked_ids
             has_role = role in member.roles
             try:
                 if is_linked and not has_role:
@@ -165,6 +264,37 @@ class LinkBot(commands.Bot):
                     await member.remove_roles(role, reason="Discord отвязан на сайте")
             except discord.Forbidden:
                 log.warning("Не хватает прав изменить роли для %s", member)
+
+            if not managed_role_ids:
+                continue
+
+            desired_role_ids = set()
+            steamid64 = steamid64_by_discord.get(discord_id)
+            if steamid64:
+                for group_name in admin_groups_by_steamid64.get(steamid64, ()):
+                    desired_role_ids |= admin_role_map.get(group_name, set())
+
+                try:
+                    account_id = int(steamid64) - STEAMID64_BASE
+                except ValueError:
+                    account_id = None
+                if account_id is not None:
+                    for group_key in vip_groups_by_account_id.get(account_id, ()):
+                        desired_role_ids |= vip_role_map.get(group_key, set())
+
+            current_managed_ids = {r.id for r in member.roles} & managed_role_ids
+            to_add = [guild.get_role(rid) for rid in desired_role_ids - current_managed_ids]
+            to_remove = [guild.get_role(rid) for rid in current_managed_ids - desired_role_ids]
+            to_add = [r for r in to_add if r is not None]
+            to_remove = [r for r in to_remove if r is not None]
+
+            try:
+                if to_add:
+                    await member.add_roles(*to_add, reason="Синхронизация роли/VIP с сайтом")
+                if to_remove:
+                    await member.remove_roles(*to_remove, reason="Роль/VIP на сайте больше не активны")
+            except discord.Forbidden:
+                log.warning("Не хватает прав изменить привилегированные роли для %s", member)
 
     @sync_roles.before_loop
     async def before_sync_roles(self):
@@ -181,7 +311,8 @@ async def link(interaction: discord.Interaction):
         description=(
             "1. Войдите на сайт через Steam.\n"
             f"2. Откройте [настройки профиля]({LINK_URL}) и нажмите «Привязать Discord».\n\n"
-            "Роль на сервере выдастся автоматически в течение минуты после привязки."
+            "Роль на сервере (включая привилегии администратора и VIP) выдастся "
+            "автоматически в течение часа после привязки/изменения на сайте."
         ),
         color=discord.Color.blurple(),
     )

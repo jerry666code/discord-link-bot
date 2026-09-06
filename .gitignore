@@ -1,4 +1,5 @@
 .env
+role_mapping.json
 __pycache__/
 *.pyc
 .venv/
