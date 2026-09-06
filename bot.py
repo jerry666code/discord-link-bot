@@ -74,7 +74,10 @@ def load_role_mapping() -> dict:
     сразу несколько ролей в Discord."""
     empty = {"admin_groups": {}, "vip_groups": {}}
     try:
-        with open(ROLE_MAPPING_FILE, "r", encoding="utf-8") as f:
+        # utf-8-sig проглатывает BOM, который некоторые редакторы (в т.ч. на
+        # хостингах) молча добавляют в начало файла и который иначе ломает
+        # json.load с ошибкой "Expecting value: line 1 column 1".
+        with open(ROLE_MAPPING_FILE, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except FileNotFoundError:
         log.warning(
