@@ -166,9 +166,37 @@ async def handle_discord_exchange(request: web.Request) -> web.Response:
     })
 
 
+async def handle_sync_member(request: web.Request) -> web.Response:
+    """Сайт дёргает это сразу после AuthController::discordLinkCallback,
+    чтобы роль выдалась мгновенно, а не ждала часового тика."""
+    if not hmac.compare_digest(request.headers.get("X-Relay-Secret", ""), RELAY_SECRET):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    try:
+        payload = await request.json()
+    except ValueError:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    discord_id = str(payload.get("discord_id") or "").strip()
+    if not discord_id.isdigit():
+        return web.json_response({"ok": False, "error": "missing_or_invalid_discord_id"}, status=400)
+
+    await bot.sync_member_now(discord_id)
+    return web.json_response({"ok": True})
+
+
 class LinkBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix=commands.when_mentioned, intents=intents, status=discord.Status.invisible)
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=intents,
+            status=discord.Status.invisible,
+            # Явно, а не полагаясь на дефолты: без этого при большом сервере
+            # часть офлайн-участников может не попасть в guild.members, и
+            # синхронизация ролей их просто не увидит.
+            chunk_guilds_at_startup=True,
+            member_cache_flags=discord.MemberCacheFlags.all(),
+        )
         self.db_pool = None
 
     async def setup_hook(self):
@@ -192,6 +220,7 @@ class LinkBot(commands.Bot):
         try:
             app = web.Application()
             app.router.add_post("/discord-exchange", handle_discord_exchange)
+            app.router.add_post("/sync-member", handle_sync_member)
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -210,27 +239,9 @@ class LinkBot(commands.Bot):
             await self.db_pool.wait_closed()
         await super().close()
 
-    @tasks.loop(seconds=SYNC_INTERVAL_SECONDS)
-    async def sync_roles(self):
-        guild = self.get_guild(GUILD_ID)
-        if guild is None:
-            return
-        role = guild.get_role(VERIFIED_ROLE_ID)
-        if role is None:
-            log.warning("VERIFIED_ROLE_ID %s not found in guild %s", VERIFIED_ROLE_ID, GUILD_ID)
-            return
-
-        role_mapping = load_role_mapping()
-        admin_role_map = role_mapping["admin_groups"]
-        vip_role_map = role_mapping["vip_groups"]
-        # Роли, которыми бот управляет сам — их можно снимать, если участник
-        # больше не подпадает ни под один маппинг; остальные роли не трогаем.
-        managed_role_ids = set()
-        for role_ids in admin_role_map.values():
-            managed_role_ids |= role_ids
-        for role_ids in vip_role_map.values():
-            managed_role_ids |= role_ids
-
+    async def _load_role_state(self, admin_role_map: dict, vip_role_map: dict):
+        """Один общий снимок из БД — используется и часовым циклом, и мгновенной
+        синхронизацией по вебхуку, чтобы логика не расходилась в двух местах."""
         async with self.db_pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SELECT discord_id, steamid64 FROM users WHERE discord_id IS NOT NULL")
@@ -259,6 +270,143 @@ class LinkBot(commands.Bot):
                     for account_id, group_key in await cur.fetchall():
                         vip_groups_by_account_id.setdefault(account_id, set()).add(group_key)
 
+        return linked_rows, admin_groups_by_steamid64, vip_groups_by_account_id
+
+    @staticmethod
+    def _desired_managed_roles(
+        steamid64, admin_role_map: dict, vip_role_map: dict, admin_groups_by_steamid64: dict, vip_groups_by_account_id: dict
+    ) -> set:
+        desired = set()
+        if not steamid64:
+            return desired
+
+        for group_name in admin_groups_by_steamid64.get(steamid64, ()):
+            desired |= admin_role_map.get(group_name, set())
+
+        try:
+            account_id = int(steamid64) - STEAMID64_BASE
+        except ValueError:
+            return desired
+        for group_key in vip_groups_by_account_id.get(account_id, ()):
+            desired |= vip_role_map.get(group_key, set())
+        return desired
+
+    @staticmethod
+    async def _sync_member(
+        guild: discord.Guild,
+        member: discord.Member,
+        verified_role: discord.Role,
+        is_linked: bool,
+        managed_role_ids: set,
+        desired_managed_role_ids: set,
+    ):
+        try:
+            has_role = verified_role in member.roles
+            if is_linked and not has_role:
+                await member.add_roles(verified_role, reason="Discord привязан на сайте")
+            elif not is_linked and has_role:
+                await member.remove_roles(verified_role, reason="Discord отвязан на сайте")
+        except discord.HTTPException as e:
+            # HTTPException (не только Forbidden) — например участник вышел с
+            # сервера между чтением guild.members и этим вызовом (404). Раньше
+            # это не ловилось и убивало весь цикл до следующего рестарта бота.
+            log.warning("Не удалось изменить верификационную роль для %s: %s", member, e)
+
+        if not managed_role_ids:
+            return
+
+        current_managed_ids = {r.id for r in member.roles} & managed_role_ids
+        to_add = [guild.get_role(rid) for rid in desired_managed_role_ids - current_managed_ids]
+        to_remove = [guild.get_role(rid) for rid in current_managed_ids - desired_managed_role_ids]
+        to_add = [r for r in to_add if r is not None]
+        to_remove = [r for r in to_remove if r is not None]
+
+        try:
+            if to_add:
+                await member.add_roles(*to_add, reason="Синхронизация роли/VIP с сайтом")
+            if to_remove:
+                await member.remove_roles(*to_remove, reason="Роль/VIP на сайте больше не активны")
+        except discord.HTTPException as e:
+            log.warning("Не удалось изменить привилегированные роли для %s: %s", member, e)
+
+    def _load_role_mapping_and_managed_ids(self):
+        role_mapping = load_role_mapping()
+        admin_role_map = role_mapping["admin_groups"]
+        vip_role_map = role_mapping["vip_groups"]
+        # Роли, которыми бот управляет сам — их можно снимать, если участник
+        # больше не подпадает ни под один маппинг; остальные роли не трогаем.
+        managed_role_ids = set()
+        for role_ids in admin_role_map.values():
+            managed_role_ids |= role_ids
+        for role_ids in vip_role_map.values():
+            managed_role_ids |= role_ids
+        return admin_role_map, vip_role_map, managed_role_ids
+
+    async def sync_member_now(self, discord_id: str):
+        """Мгновенная синхронизация одного участника — дёргается сайтом сразу
+        после привязки Discord, чтобы не ждать часового цикла."""
+        guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            log.warning("sync_member_now: гильдия %s ещё не готова", GUILD_ID)
+            return
+        verified_role = guild.get_role(VERIFIED_ROLE_ID)
+        if verified_role is None:
+            log.warning("VERIFIED_ROLE_ID %s not found in guild %s", VERIFIED_ROLE_ID, GUILD_ID)
+            return
+
+        member = guild.get_member(int(discord_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(discord_id))
+            except discord.NotFound:
+                log.info("sync_member_now: %s не найден на сервере Discord", discord_id)
+                return
+            except discord.HTTPException as e:
+                log.warning("sync_member_now: не удалось получить участника %s: %s", discord_id, e)
+                return
+
+        admin_role_map, vip_role_map, managed_role_ids = self._load_role_mapping_and_managed_ids()
+
+        try:
+            linked_rows, admin_groups_by_steamid64, vip_groups_by_account_id = await self._load_role_state(
+                admin_role_map, vip_role_map
+            )
+        except Exception:
+            log.exception("sync_member_now: не удалось загрузить данные из БД")
+            return
+
+        steamid64_by_discord = {str(d): s for d, s in linked_rows if s}
+        is_linked = discord_id in {str(d) for d, _ in linked_rows}
+        steamid64 = steamid64_by_discord.get(discord_id)
+        desired = self._desired_managed_roles(
+            steamid64, admin_role_map, vip_role_map, admin_groups_by_steamid64, vip_groups_by_account_id
+        )
+        await self._sync_member(guild, member, verified_role, is_linked, managed_role_ids, desired)
+        log.info("sync_member_now: синхронизировал роли для %s", member)
+
+    @tasks.loop(seconds=SYNC_INTERVAL_SECONDS)
+    async def sync_roles(self):
+        guild = self.get_guild(GUILD_ID)
+        if guild is None:
+            return
+        verified_role = guild.get_role(VERIFIED_ROLE_ID)
+        if verified_role is None:
+            log.warning("VERIFIED_ROLE_ID %s not found in guild %s", VERIFIED_ROLE_ID, GUILD_ID)
+            return
+
+        admin_role_map, vip_role_map, managed_role_ids = self._load_role_mapping_and_managed_ids()
+
+        try:
+            linked_rows, admin_groups_by_steamid64, vip_groups_by_account_id = await self._load_role_state(
+                admin_role_map, vip_role_map
+            )
+        except Exception:
+            # Раньше исключение здесь (обрыв соединения с БД и т.п.) вылетало из
+            # tasks.loop необработанным и останавливало цикл навсегда — отсюда
+            # и был баг "роли выдаются один раз при рестарте, потом перестают".
+            log.exception("sync_roles: не удалось загрузить данные из БД, пропускаю тик")
+            return
+
         linked_ids = {str(discord_id) for discord_id, _ in linked_rows}
         steamid64_by_discord = {
             str(discord_id): steamid64 for discord_id, steamid64 in linked_rows if steamid64
@@ -267,49 +415,28 @@ class LinkBot(commands.Bot):
         for member in guild.members:
             discord_id = str(member.id)
             is_linked = discord_id in linked_ids
-            has_role = role in member.roles
-            try:
-                if is_linked and not has_role:
-                    await member.add_roles(role, reason="Discord привязан на сайте")
-                elif not is_linked and has_role:
-                    await member.remove_roles(role, reason="Discord отвязан на сайте")
-            except discord.Forbidden:
-                log.warning("Не хватает прав изменить роли для %s", member)
-
-            if not managed_role_ids:
-                continue
-
-            desired_role_ids = set()
             steamid64 = steamid64_by_discord.get(discord_id)
-            if steamid64:
-                for group_name in admin_groups_by_steamid64.get(steamid64, ()):
-                    desired_role_ids |= admin_role_map.get(group_name, set())
-
-                try:
-                    account_id = int(steamid64) - STEAMID64_BASE
-                except ValueError:
-                    account_id = None
-                if account_id is not None:
-                    for group_key in vip_groups_by_account_id.get(account_id, ()):
-                        desired_role_ids |= vip_role_map.get(group_key, set())
-
-            current_managed_ids = {r.id for r in member.roles} & managed_role_ids
-            to_add = [guild.get_role(rid) for rid in desired_role_ids - current_managed_ids]
-            to_remove = [guild.get_role(rid) for rid in current_managed_ids - desired_role_ids]
-            to_add = [r for r in to_add if r is not None]
-            to_remove = [r for r in to_remove if r is not None]
-
+            desired = self._desired_managed_roles(
+                steamid64, admin_role_map, vip_role_map, admin_groups_by_steamid64, vip_groups_by_account_id
+            )
             try:
-                if to_add:
-                    await member.add_roles(*to_add, reason="Синхронизация роли/VIP с сайтом")
-                if to_remove:
-                    await member.remove_roles(*to_remove, reason="Роль/VIP на сайте больше не активны")
-            except discord.Forbidden:
-                log.warning("Не хватает прав изменить привилегированные роли для %s", member)
+                await self._sync_member(guild, member, verified_role, is_linked, managed_role_ids, desired)
+            except Exception:
+                # Любая другая неожиданная ошибка на одном участнике не должна
+                # прерывать обработку остальных и убивать весь цикл.
+                log.exception("sync_roles: не удалось синхронизировать %s", member)
 
     @sync_roles.before_loop
     async def before_sync_roles(self):
         await self.wait_until_ready()
+
+    @sync_roles.error
+    async def sync_roles_error(self, error: Exception):
+        # Последний рубеж: если что-то всё-таки просочилось выше и штатно
+        # остановило tasks.loop, перезапускаем его вместо того, чтобы молча
+        # перестать синхронизировать роли до ручного рестарта бота.
+        log.error("sync_roles упал с необработанной ошибкой, перезапускаю цикл", exc_info=error)
+        self.sync_roles.restart()
 
 
 bot = LinkBot()
@@ -323,7 +450,8 @@ async def link(interaction: discord.Interaction):
             "1. Войдите на сайт через Steam.\n"
             f"2. Откройте [настройки профиля]({LINK_URL}) и нажмите «Привязать Discord».\n\n"
             "Роль на сервере (включая привилегии администратора и VIP) выдастся "
-            "автоматически в течение часа после привязки/изменения на сайте."
+            "автоматически сразу после привязки, а изменения на сайте позже "
+            "подхватываются в течение часа."
         ),
         color=discord.Color.blurple(),
     )
