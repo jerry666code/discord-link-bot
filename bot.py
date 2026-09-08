@@ -39,6 +39,9 @@ DISCORD_CLIENT_ID = os.environ["DISCORD_CLIENT_ID"]
 DISCORD_CLIENT_SECRET = os.environ["DISCORD_CLIENT_SECRET"]
 RELAY_SECRET = os.environ["RELAY_SECRET"]
 PORT = int(os.environ.get("PORT", "8080"))
+# Канал, куда зеркалятся действия веб-админки (Services\AdminLog на сайте).
+# Не задан = /admin-log просто отвечает 503, ничего не роняя.
+ADMIN_LOG_CHANNEL_ID = os.environ.get("ADMIN_LOG_CHANNEL_ID")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("link-bot")
@@ -185,6 +188,47 @@ async def handle_sync_member(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def handle_admin_log(request: web.Request) -> web.Response:
+    """Зеркалит действие веб-админки (Services\\AdminLog::record на сайте) в
+    Discord-канал. Тем же приёмом, что и /discord-exchange: сайт не может
+    достучаться до discord.com напрямую, поэтому шлёт сюда, а сообщение в
+    канал уходит через уже открытое соединение бота."""
+    if not hmac.compare_digest(request.headers.get("X-Relay-Secret", ""), RELAY_SECRET):
+        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
+
+    if not ADMIN_LOG_CHANNEL_ID:
+        return web.json_response({"ok": False, "error": "admin_log_channel_not_configured"}, status=503)
+
+    try:
+        payload = await request.json()
+    except ValueError:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    admin_name = str(payload.get("admin_name") or "Admin")[:256]
+    admin_steamid = str(payload.get("admin_steamid") or "")[:32]
+    action = str(payload.get("action") or "—")[:1024]
+    target = str(payload.get("target") or "")[:1024]
+    details = str(payload.get("details") or "")[:1024]
+    admin_label = f"{admin_name} ({admin_steamid})" if admin_steamid else admin_name
+
+    embed = discord.Embed(title="Действие в админ-панели", color=discord.Color.blurple())
+    embed.add_field(name="Админ", value=admin_label, inline=True)
+    embed.add_field(name="Действие", value=action, inline=True)
+    if target:
+        embed.add_field(name="Кому / что", value=target, inline=False)
+    if details:
+        embed.add_field(name="Подробности", value=details, inline=False)
+
+    try:
+        channel = bot.get_channel(int(ADMIN_LOG_CHANNEL_ID)) or await bot.fetch_channel(int(ADMIN_LOG_CHANNEL_ID))
+        await channel.send(embed=embed)
+    except (discord.HTTPException, ValueError) as e:
+        log.warning("admin-log: не удалось отправить сообщение в канал %s: %s", ADMIN_LOG_CHANNEL_ID, e)
+        return web.json_response({"ok": False, "error": "send_failed"}, status=502)
+
+    return web.json_response({"ok": True})
+
+
 class LinkBot(commands.Bot):
     def __init__(self):
         super().__init__(
@@ -221,6 +265,7 @@ class LinkBot(commands.Bot):
             app = web.Application()
             app.router.add_post("/discord-exchange", handle_discord_exchange)
             app.router.add_post("/sync-member", handle_sync_member)
+            app.router.add_post("/admin-log", handle_admin_log)
             runner = web.AppRunner(app)
             await runner.setup()
             site = web.TCPSite(runner, "0.0.0.0", PORT)
