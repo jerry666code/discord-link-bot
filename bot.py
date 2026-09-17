@@ -72,6 +72,19 @@ def normalize_steamid64(steamid: str):
     return None
 
 
+def steamid_all_formats(steamid64: str) -> list:
+    """Порт Services\\SteamIdentity::allFormats (public/src/Services/SteamIdentity.php).
+    as_punishments/as_admins пишет игровой плагин, а не сайт, и он может
+    записать SteamID игрока в любом из этих форматов — поиск по одному
+    только SteamID64 в этих таблицах ничего не найдёт."""
+    formats = [steamid64]
+    if _STEAM64_RE.match(steamid64):
+        account = int(steamid64) - STEAMID64_BASE
+        y, z = account % 2, account // 2
+        formats += [f"STEAM_1:{y}:{z}", f"STEAM_0:{y}:{z}", f"[U:1:{account}]"]
+    return list(dict.fromkeys(formats))
+
+
 # ── /admin-log rich cards ────────────────────────────────────────────────────
 # Дизайн-цель: для «крупных» действий (наказания, админы, VIP) собрать embed
 # с аватаркой игрока и разложенными по полям деталями вместо одной строки
@@ -258,12 +271,14 @@ async def fetch_punishment_context(steamid64: str):
     if bot.db_pool is None:
         return None
     try:
+        formats = steamid_all_formats(steamid64)
+        placeholders = ",".join(["%s"] * len(formats))
         async with bot.db_pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT punish_type, reason, datestart, expires, server_id FROM as_punishments "
-                    "WHERE steamid = %s ORDER BY id DESC LIMIT 1",
-                    (steamid64,),
+                    f"WHERE steamid IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+                    formats,
                 )
                 row = await cur.fetchone()
                 if not row:
@@ -311,10 +326,12 @@ async def fetch_admin_context(steamid64: str, details: str):
                             if names:
                                 server_text = ", ".join(names)
 
+                    admin_formats = steamid_all_formats(steamid64)
+                    admin_placeholders = ",".join(["%s"] * len(admin_formats))
                     await cur.execute(
                         "SELECT s.expires FROM as_admins_servers s JOIN as_admins a ON a.id = s.admin_id "
-                        "WHERE a.steamid = %s ORDER BY s.expires DESC LIMIT 1",
-                        (steamid64,),
+                        f"WHERE a.steamid IN ({admin_placeholders}) ORDER BY s.expires DESC LIMIT 1",
+                        admin_formats,
                     )
                     row = await cur.fetchone()
                     duration = None
