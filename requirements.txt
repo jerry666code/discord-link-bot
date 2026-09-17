@@ -1,4 +1,9 @@
 discord.py>=2.4,<3
 aiomysql>=0.2,<1
+# aiomysql still imports escape_dict/escape_sequence/escape_string from
+# pymysql.converters using the pre-1.1 API; PyMySQL 1.1+ dropped them,
+# which crashes the bot at "import aiomysql" before anything else runs
+# (ImportError: cannot import name 'escape_dict' from 'pymysql.converters').
+PyMySQL<1.1
 python-dotenv>=1.0,<2
 aiohttp>=3.9,<4
