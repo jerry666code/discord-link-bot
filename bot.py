@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import aiohttp
 import aiomysql
@@ -19,6 +20,10 @@ DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 VERIFIED_ROLE_ID = int(os.environ["VERIFIED_ROLE_ID"])
 LINK_URL = os.environ.get("LINK_URL", "https://www.boberland.ru/api/auth/discord/link")
+# Для ссылок на профиль игрока в карточках /admin-log (Services\AdminLog::record
+# шлёт их уже сюда, но не для всех действий — для некоторых их приходится
+# строить самим, см. build_action_embed).
+SITE_URL = os.environ.get("SITE_URL", "https://www.boberland.ru")
 # По умолчанию раз в час — под VERIFIED_ROLE_ID и под роли из ROLE_MAPPING_FILE.
 SYNC_INTERVAL_SECONDS = int(os.environ.get("SYNC_INTERVAL_SECONDS", "3600"))
 # Дефолт — рядом с bot.py, а не от текущей рабочей директории процесса: на
@@ -65,6 +70,407 @@ def normalize_steamid64(steamid: str):
     if m:
         return str(STEAMID64_BASE + int(m.group(2)) * 2 + int(m.group(1)))
     return None
+
+
+# ── /admin-log rich cards ────────────────────────────────────────────────────
+# Дизайн-цель: для «крупных» действий (наказания, админы, VIP) собрать embed
+# с аватаркой игрока и разложенными по полям деталями вместо одной строки
+# текста. Данных, которых сайт не прислал в payload (сервер наказания, срок
+# админки и т.п.), тут не хватает — вместо того чтобы просить сайт слать
+# больше полей, бот сам читает их из той же БД, к которой уже подключён для
+# синхронизации ролей (self.db_pool, read-only). Для любого действия, для
+# которого нет готовой карточки — или нет данных её собрать, — используется
+# старый общий embed (Админ/Действие/Кому-что/Подробности), как раньше.
+
+# Ключ бота -> русская метка, которую шлёт Services\AdminLog::record()
+# (ACTION_LABELS в public/src/Services/AdminLog.php — единственный источник
+# правды на стороне сайта; менять его нужно синхронно с этим словарём).
+ACTION_KEY_BY_LABEL = {
+    "Выдано наказание": "issue_punishment",
+    "Снято наказание": "unpunish",
+    "Удалена запись наказания": "delete_punishment",
+    "Добавлен админ": "add_admin",
+    "Изменён админ": "edit_admin",
+    "Удалён админ": "delete_admin",
+    "Админ снят за варны": "auto_remove_admin",
+    "Выдан VIP": "set_vip",
+    "Удалён VIP": "delete_vip",
+    "Назначен набор доступа": "assign_permission_set",
+    "Отозван набор доступа": "revoke_permission_set",
+}
+
+CARD_TITLE = {
+    "issue_punishment": "Наказание",
+    "unpunish": "Наказание",
+    "delete_punishment": "Наказание",
+    "add_admin": "Админка",
+    "edit_admin": "Админка",
+    "delete_admin": "Админка",
+    "auto_remove_admin": "Админка",
+    "set_vip": "Привилегия",
+    "delete_vip": "Привилегия",
+    "assign_permission_set": "Доступ к панели",
+    "revoke_permission_set": "Доступ к панели",
+}
+
+# Порт Services\PanelAccess::CAPABILITY_CATALOG (public/src/Services/PanelAccess.php)
+# — только подписи, группировка по вкладкам тут не нужна. Меняются оба списка
+# синхронно; расхождение не ломает ничего, просто код без перевода уйдёт как есть.
+CAPABILITY_LABELS = {
+    "dashboard.view": "Просмотр главной",
+    "punishments.view": "Просмотр наказаний",
+    "punishments.issue": "Выдача наказаний",
+    "punishments.unpunish": "Снятие наказаний",
+    "punishments.delete": "Удаление наказаний",
+    "checks.view": "Просмотр проверок",
+    "checks.delete": "Удаление проверок",
+    "admins.view": "Просмотр администраторов",
+    "admins.create": "Выдача администратора",
+    "admins.edit": "Изменение администратора",
+    "admins.delete": "Снятие администратора",
+    "vips.view": "Просмотр VIP",
+    "vips.grant": "Выдача VIP",
+    "vips.revoke": "Снятие VIP",
+    "finances.view": "Просмотр финансов",
+    "finances.edit_balance": "Изменение баланса",
+    "finances.wipe": "Очистка финансов",
+    "stats_lr.view": "Просмотр опыта",
+    "stats_lr.edit": "Изменение опыта",
+    "stats_lr.wipe": "Очистка опыта",
+    "promo.view": "Просмотр промокодов",
+    "promo.manage": "Создание и изменение промокодов",
+    "seasons.view": "Просмотр сезонов",
+    "seasons.manage": "Управление сезонами и призами",
+    "badges.view": "Просмотр бейджей профиля",
+    "badges.manage": "Управление бейджами и их выдача",
+    "logs.view": "Просмотр логов",
+    "logs.clear": "Очистка логов",
+    "reports.view": "Просмотр репортов",
+    "reports.manage": "Обработка репортов",
+    "reports.settings.view": "Просмотр настроек репортов",
+    "reports.settings.manage": "Изменение настроек репортов",
+    "tickets.view": "Рассмотрение тикетов (очередь и ответы)",
+    "tickets.settings.manage": "Настройки тикетов (категории, ответы, уведомления)",
+    "settings.groups.view": "Просмотр админ-групп",
+    "settings.groups.manage": "Управление админ-группами",
+    "settings.vip_groups.view": "Просмотр VIP-групп",
+    "settings.vip_groups.manage": "Управление VIP-группами",
+    "settings.reasons.view": "Просмотр причин",
+    "settings.reasons.manage": "Управление причинами",
+    "settings.durations.view": "Просмотр сроков",
+    "settings.durations.manage": "Управление сроками",
+    "panel_access.view": "Просмотр доступов",
+    "panel_access.manage": "Выдача и отзыв доступов",
+    "permission_sets.view": "Просмотр наборов доступов",
+    "permission_sets.manage": "Создание и изменение наборов",
+    "permission_sets.assign": "Назначение наборов пользователям",
+    "notifications.send": "Отправка уведомлений игрокам",
+    "shop.manage_status": "Закрытие/открытие магазина (техработы)",
+    "daily_rewards.manage": "Управление ежедневными наградами",
+    "efficiency.view": "Сводки и статистика всех админов",
+    "efficiency.summaries.manage": "Формирование и пересчёт сводок",
+    "efficiency.admins.manage": "Управление списком админов",
+    "efficiency.warns.manage": "Выдача и снятие варнов за норму",
+    "efficiency.rewards.manage": "Выдача наград",
+    "efficiency.settings.manage": "Настройки модуля",
+    "efficiency.logs.view": "Журнал модуля",
+}
+
+CARD_COLOR = {
+    "issue_punishment": discord.Color.red(),
+    "unpunish": discord.Color.green(),
+    "delete_punishment": discord.Color.dark_grey(),
+    "add_admin": discord.Color.blue(),
+    "edit_admin": discord.Color.gold(),
+    "delete_admin": discord.Color.red(),
+    "auto_remove_admin": discord.Color.red(),
+    "set_vip": discord.Color.green(),
+    "delete_vip": discord.Color.red(),
+    "assign_permission_set": discord.Color.blue(),
+    "revoke_permission_set": discord.Color.red(),
+}
+
+PUNISH_TYPE_LABELS = {0: "Бан", 1: "Мут", 2: "Гаг"}
+
+_TARGET_LINK_RE = re.compile(r"^\[(\d+)]\(([^)]*)\)$")
+_ADMIN_DETAILS_RE = re.compile(r"^Группа: (?P<group>.+), серверы: (?P<servers>.+)$")
+_VIP_DETAILS_RE = re.compile(r"^VIP-группа (?P<group>\S+), сервер (?P<server>-?\d+), срок (?P<duration>\d+) сек\.")
+
+
+def parse_target(raw: str):
+    """target из /admin-log — Services\\AdminLog::linkifySteamId либо обернул
+    steamid64 в markdown-ссылку "[id](url)", либо оставил как есть (account_id,
+    ID записи наказания, устаревший формат STEAM_x:y:z). Возвращает
+    (steamid64|None, ссылка на профиль|None)."""
+    raw = (raw or "").strip()
+    m = _TARGET_LINK_RE.match(raw)
+    if m:
+        return m.group(1), m.group(2)
+    steamid64 = normalize_steamid64(raw)
+    if steamid64:
+        return steamid64, f"{SITE_URL}/profile/{steamid64}"
+    return None, None
+
+
+def humanize_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "Навсегда"
+    units = [("нед.", 604800), ("дн.", 86400), ("ч.", 3600), ("мин.", 60), ("сек.", 1)]
+    parts = []
+    remaining = int(seconds)
+    for label, size in units:
+        if remaining >= size:
+            value, remaining = divmod(remaining, size)
+            parts.append(f"{value} {label}")
+        if len(parts) == 2:
+            break
+    return " ".join(parts) if parts else "0 сек."
+
+
+async def fetch_player_profile(steamid64: str):
+    """(имя, аватар|None, ссылка на профиль) — из кэша steam_profiles
+    (public/src/Services/SteamProfiles.php пишет его же). Отсутствие строки
+    в кэше — не ошибка, просто игрок ещё не открывал профиль на сайте."""
+    name, avatar, profile_url = steamid64, None, f"{SITE_URL}/profile/{steamid64}"
+    if bot.db_pool is None:
+        return name, avatar, profile_url
+    try:
+        async with bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT persona_name, avatar, profile_url FROM steam_profiles WHERE steamid64 = %s LIMIT 1",
+                    (steamid64,),
+                )
+                row = await cur.fetchone()
+                if row and row[0]:
+                    name = row[0]
+                    avatar = row[1] or avatar
+                    profile_url = row[2] or profile_url
+    except Exception:
+        log.exception("admin-log: не удалось получить Steam-профиль %s", steamid64)
+    return name, avatar, profile_url
+
+
+async def fetch_punishment_context(steamid64: str):
+    """Тип/причина/срок/сервер последнего наказания игрока — читается из
+    as_punishments напрямую, а не парсится из текста details, чтобы не
+    зависеть от формулировок на стороне сайта."""
+    if bot.db_pool is None:
+        return None
+    try:
+        async with bot.db_pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT punish_type, reason, datestart, expires, server_id FROM as_punishments "
+                    "WHERE steamid = %s ORDER BY id DESC LIMIT 1",
+                    (steamid64,),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                server_name = "Все сервера"
+                server_id = row.get("server_id")
+                if server_id and int(server_id) > 0:
+                    await cur.execute("SELECT name FROM servers WHERE id = %s LIMIT 1", (server_id,))
+                    srow = await cur.fetchone()
+                    if srow and srow.get("name"):
+                        server_name = srow["name"]
+                punish_type = int(row.get("punish_type") or 0)
+                expires = int(row.get("expires") or 0)
+                datestart = int(row.get("datestart") or 0)
+                duration_text = "Навсегда" if expires == 0 else humanize_duration(max(0, expires - datestart))
+                return {
+                    "type": PUNISH_TYPE_LABELS.get(punish_type, "Наказание"),
+                    "reason": row.get("reason") or "—",
+                    "duration": duration_text,
+                    "server": server_name,
+                }
+    except Exception:
+        log.exception("admin-log: не удалось получить наказание для %s", steamid64)
+        return None
+
+
+async def fetch_admin_context(steamid64: str, details: str):
+    """Группа/сервера из details (формат стабильный, задаётся тем же кодом,
+    что шлёт вебхук) + срок из as_admins_servers, которого в details нет."""
+    m = _ADMIN_DETAILS_RE.match(details or "")
+    group = m.group("group") if m else None
+    servers_raw = m.group("servers") if m else None
+    server_text = "Все сервера"
+
+    if bot.db_pool is not None:
+        try:
+            async with bot.db_pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    if servers_raw and servers_raw.strip() != "-1":
+                        ids = [s.strip() for s in servers_raw.split(",") if s.strip().isdigit()]
+                        if ids:
+                            placeholders = ",".join(["%s"] * len(ids))
+                            await cur.execute(f"SELECT name FROM servers WHERE id IN ({placeholders})", ids)
+                            names = [r[0] for r in await cur.fetchall() if r and r[0]]
+                            if names:
+                                server_text = ", ".join(names)
+
+                    await cur.execute(
+                        "SELECT s.expires FROM as_admins_servers s JOIN as_admins a ON a.id = s.admin_id "
+                        "WHERE a.steamid = %s ORDER BY s.expires DESC LIMIT 1",
+                        (steamid64,),
+                    )
+                    row = await cur.fetchone()
+                    duration = None
+                    if row is not None:
+                        expires = int(row[0] or 0)
+                        duration = "Навсегда" if expires == 0 else humanize_duration(max(0, expires - int(time.time())))
+        except Exception:
+            log.exception("admin-log: не удалось получить контекст админа %s", steamid64)
+            duration = None
+    else:
+        duration = None
+
+    return {"group": group, "server": server_text, "duration": duration}
+
+
+async def fetch_vip_context(details: str):
+    """Группа/сервер/срок из details (формат стабильный) + человекочитаемое
+    название VIP-группы из admin_vip_groups, которого в details нет — там
+    только group_key."""
+    m = _VIP_DETAILS_RE.match(details or "")
+    if not m:
+        return None
+    group_key = m.group("group")
+    server_id = int(m.group("server"))
+    duration = int(m.group("duration"))
+
+    group_name = group_key
+    server_text = "Все сервера"
+    if bot.db_pool is not None:
+        try:
+            async with bot.db_pool.acquire() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute("SELECT name_ru FROM admin_vip_groups WHERE group_key = %s LIMIT 1", (group_key,))
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        group_name = row[0]
+                    if server_id > 1:
+                        await cur.execute("SELECT name FROM servers WHERE id = %s LIMIT 1", (server_id,))
+                        srow = await cur.fetchone()
+                        if srow and srow[0]:
+                            server_text = srow[0]
+        except Exception:
+            log.exception("admin-log: не удалось получить контекст VIP %s", group_key)
+
+    return {"group": group_name, "server": server_text, "duration": humanize_duration(duration)}
+
+
+async def fetch_permission_set_context(steamid64: str):
+    """Текущий набор доступа к веб-панели и его права — admin_center_access
+    хранит одну строку на steamid64 (UNIQUE, обновляется через ON DUPLICATE
+    KEY UPDATE), поэтому запись остаётся и после отзыва (revoked_at просто
+    проставляется), permission_set_id по-прежнему указывает на последний
+    выданный набор. details с сайта ("Набор: {name}"/"Набор отозван") тут не
+    нужен вообще — читаем актуальное состояние напрямую."""
+    if bot.db_pool is None:
+        return None
+    try:
+        async with bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT p.id, p.name FROM admin_center_access a "
+                    "JOIN admin_permission_sets p ON p.id = a.permission_set_id "
+                    "WHERE a.steamid64 = %s LIMIT 1",
+                    (steamid64,),
+                )
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                set_id, set_name = row
+
+                await cur.execute(
+                    "SELECT capability FROM admin_permission_set_capabilities WHERE permission_set_id = %s",
+                    (set_id,),
+                )
+                codes = [r[0] for r in await cur.fetchall()]
+    except Exception:
+        log.exception("admin-log: не удалось получить набор доступа для %s", steamid64)
+        return None
+
+    if "*" in codes:
+        capabilities_text = "Все права"
+    else:
+        labels = [CAPABILITY_LABELS.get(code, code) for code in codes]
+        capabilities_text = ", ".join(labels) if labels else "—"
+        if len(capabilities_text) > 1024:
+            capabilities_text = capabilities_text[:1000].rsplit(", ", 1)[0] + ", …"
+
+    return {"name": set_name, "capabilities": capabilities_text}
+
+
+async def build_action_embed(action_key: str, action_label: str, target_raw: str, details: str, admin_label: str):
+    """None означает "нет карточки под это действие или не хватило данных" —
+    вызывающая сторона в этом случае шлёт старый общий embed."""
+    steamid64, profile_url = parse_target(target_raw)
+
+    # DELETE_VIP шлёт vip_users.account_id, а не steamid — это единственное
+    # действие, где target не steamid ни в каком виде.
+    if action_key == "delete_vip" and steamid64 is None:
+        stripped = target_raw.strip()
+        if stripped.lstrip("-").isdigit():
+            steamid64 = str(STEAMID64_BASE + int(stripped))
+            profile_url = f"{SITE_URL}/profile/{steamid64}"
+
+    if steamid64 is None:
+        return None
+
+    name, avatar, resolved_profile_url = await fetch_player_profile(steamid64)
+    profile_url = profile_url or resolved_profile_url
+
+    embed = discord.Embed(
+        title=CARD_TITLE.get(action_key, "Действие в админ-панели"),
+        color=CARD_COLOR.get(action_key, discord.Color.blurple()),
+    )
+    embed.add_field(name="Игрок", value=f"[{name}]({profile_url})" if profile_url else name, inline=True)
+    embed.add_field(name="Действие", value=action_label, inline=True)
+    if avatar:
+        embed.set_thumbnail(url=avatar)
+
+    if action_key == "issue_punishment":
+        embed.add_field(name="Игра", value="CS2", inline=False)
+        context = await fetch_punishment_context(steamid64)
+        if context:
+            embed.add_field(name="Тип наказания", value=context["type"], inline=True)
+            embed.add_field(name="Причина", value=context["reason"], inline=True)
+            embed.add_field(name="Срок наказания", value=context["duration"], inline=True)
+            embed.add_field(name="Сервера", value=context["server"], inline=True)
+    elif action_key in ("unpunish", "delete_punishment"):
+        embed.add_field(name="Игра", value="CS2", inline=False)
+    elif action_key in ("add_admin", "edit_admin"):
+        embed.add_field(name="Игра", value="CS2", inline=False)
+        context = await fetch_admin_context(steamid64, details)
+        if context["group"]:
+            embed.add_field(name="Группа", value=context["group"], inline=True)
+        embed.add_field(name="Сервера", value=context["server"], inline=True)
+        if context["duration"]:
+            embed.add_field(name="Срок", value=context["duration"], inline=True)
+    elif action_key in ("delete_admin", "auto_remove_admin"):
+        embed.add_field(name="Игра", value="CS2", inline=False)
+        if action_key == "auto_remove_admin" and details:
+            embed.add_field(name="Причина", value=details, inline=False)
+    elif action_key == "set_vip":
+        context = await fetch_vip_context(details)
+        if context:
+            embed.add_field(name="Группа", value=context["group"], inline=True)
+            embed.add_field(name="Сервера", value=context["server"], inline=True)
+            embed.add_field(name="Срок", value=context["duration"], inline=True)
+    # delete_vip: данных для доп. полей нет (строка в vip_users уже удалена
+    # к моменту, когда сайт шлёт этот вебхук) — карточка остаётся минимальной.
+    elif action_key in ("assign_permission_set", "revoke_permission_set"):
+        context = await fetch_permission_set_context(steamid64)
+        if context:
+            embed.add_field(name="Набор доступа", value=context["name"], inline=True)
+            embed.add_field(name="Права доступа", value=context["capabilities"], inline=False)
+
+    embed.add_field(name="Кем", value=admin_label, inline=False)
+    return embed
 
 
 def load_role_mapping() -> dict:
@@ -211,13 +617,23 @@ async def handle_admin_log(request: web.Request) -> web.Response:
     details = str(payload.get("details") or "")[:1024]
     admin_label = f"{admin_name} ({admin_steamid})" if admin_steamid else admin_name
 
-    embed = discord.Embed(title="Действие в админ-панели", color=discord.Color.blurple())
-    embed.add_field(name="Админ", value=admin_label, inline=True)
-    embed.add_field(name="Действие", value=action, inline=True)
-    if target:
-        embed.add_field(name="Кому / что", value=target, inline=False)
-    if details:
-        embed.add_field(name="Подробности", value=details, inline=False)
+    action_key = ACTION_KEY_BY_LABEL.get(action)
+    embed = None
+    if action_key:
+        try:
+            embed = await build_action_embed(action_key, action, target, details, admin_label)
+        except Exception:
+            log.exception("admin-log: не удалось собрать карточку для действия %r", action)
+            embed = None
+
+    if embed is None:
+        embed = discord.Embed(title="Действие в админ-панели", color=discord.Color.blurple())
+        embed.add_field(name="Админ", value=admin_label, inline=True)
+        embed.add_field(name="Действие", value=action, inline=True)
+        if target:
+            embed.add_field(name="Кому / что", value=target, inline=False)
+        if details:
+            embed.add_field(name="Подробности", value=details, inline=False)
 
     try:
         channel = bot.get_channel(int(ADMIN_LOG_CHANNEL_ID)) or await bot.fetch_channel(int(ADMIN_LOG_CHANNEL_ID))
