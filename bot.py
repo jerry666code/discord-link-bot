@@ -19,11 +19,11 @@ STEAMID64_BASE = 76561197960265728
 DISCORD_BOT_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 GUILD_ID = int(os.environ["GUILD_ID"])
 VERIFIED_ROLE_ID = int(os.environ["VERIFIED_ROLE_ID"])
-LINK_URL = os.environ.get("LINK_URL", "https://www.boberland.ru/api/auth/discord/link")
+LINK_URL = os.environ.get("LINK_URL", "https://cs2volt.ru/api/auth/discord/link")
 # Для ссылок на профиль игрока в карточках /admin-log (Services\AdminLog::record
 # шлёт их уже сюда, но не для всех действий — для некоторых их приходится
 # строить самим, см. build_action_embed).
-SITE_URL = os.environ.get("SITE_URL", "https://www.boberland.ru")
+SITE_URL = os.environ.get("SITE_URL", "https://cs2volt.ru")
 # По умолчанию раз в час — под VERIFIED_ROLE_ID и под роли из ROLE_MAPPING_FILE.
 SYNC_INTERVAL_SECONDS = int(os.environ.get("SYNC_INTERVAL_SECONDS", "3600"))
 # Дефолт — рядом с bot.py, а не от текущей рабочей директории процесса: на
