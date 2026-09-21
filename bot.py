@@ -103,17 +103,83 @@ def steamid_all_formats(steamid64: str) -> list:
 # (ACTION_LABELS в public/src/Services/AdminLog.php — единственный источник
 # правды на стороне сайта; менять его нужно синхронно с этим словарём).
 ACTION_KEY_BY_LABEL = {
+    "Активирован сезон": "activate_season",
     "Выдано наказание": "issue_punishment",
     "Снято наказание": "unpunish",
     "Удалена запись наказания": "delete_punishment",
     "Добавлен админ": "add_admin",
     "Изменён админ": "edit_admin",
     "Удалён админ": "delete_admin",
+    "Добавлена админ-группа": "add_admin_group",
+    "Изменена админ-группа": "edit_admin_group",
     "Админ снят за варны": "auto_remove_admin",
+    "Выдан варн": "issue_warn",
+    "Снят варн": "remove_warn",
     "Выдан VIP": "set_vip",
     "Удалён VIP": "delete_vip",
+    "Добавлена VIP-группа": "add_vip_group",
+    "Изменена VIP-группа": "edit_vip_group",
+    "Удалена VIP-группа": "delete_vip_group",
+    "Создан бейдж": "create_badge",
+    "Обновлён бейдж": "update_badge",
+    "Удалён бейдж": "delete_badge",
+    "Выдан бейдж": "grant_badge",
+    "Отозван бейдж": "revoke_badge",
     "Назначен набор доступа": "assign_permission_set",
     "Отозван набор доступа": "revoke_permission_set",
+    "Отозван доступ к панели": "revoke_panel_access",
+    "Сохранён набор доступа": "save_permission_set",
+    "Удалён набор доступа": "delete_permission_set",
+    "Изменён баланс": "set_balance",
+    "Сброшены балансы": "wipe_balance",
+    "Изменён опыт Levels & Ranks": "set_lr_exp",
+    "Сброшена статистика Levels & Ranks": "wipe_lr_stats",
+    "Изменена роль на сайте": "set_website_role",
+    "Сохранён промокод": "save_promo",
+    "Промокод включён": "enable_promo",
+    "Промокод отключён": "disable_promo",
+    "Удалён промокод": "delete_promo",
+    "Сохранён сезон": "save_season",
+    "Удалён сезон": "delete_season",
+    "Сезон завершён": "finish_season",
+    "Выдан приз сезона": "award_season_prize",
+    "Снята выдача приза сезона": "unaward_season_prize",
+    "Сохранён приз сезона": "save_season_prize",
+    "Удалён приз сезона": "delete_season_prize",
+    "Сохранена причина": "save_reason",
+    "Удалена причина": "delete_reason",
+    "Сохранена длительность": "save_duration",
+    "Удалена длительность": "delete_duration",
+    "Отправлено уведомление": "notify",
+    "Массовое уведомление": "notify_all",
+    "Изменены настройки репортов": "save_report_settings",
+    "Сохранён вердикт репорта": "save_report_verdict",
+    "Удалён вердикт репорта": "delete_report_verdict",
+    "Репорт взят в работу": "take_report",
+    "Наказание по репорту": "report_punish",
+    "Репорт закрыт": "resolve_report",
+    "Репорт отклонён": "dismiss_report",
+    "Отказ от репорта": "refuse_report",
+    "Предупреждение по репорту": "warn_report",
+    "Удалён репорт": "delete_report",
+    "Очищены репорты": "wipe_reports",
+    "SET_CS2_REPORT_STATUS": "set_cs2_report_status",
+    "Результативность: админ добавлен в список": "eff_admin_add",
+    "Результативность: админ снят за варны": "eff_admin_auto_off",
+    "Результативность: админ удалён из списка": "eff_admin_delete",
+    "Результативность: админ изменён": "eff_admin_edit",
+    "Результативность: импорт из AdminSystem": "eff_admin_import",
+    "Результативность: синхронизация с AdminSystem": "eff_admin_sync",
+    "Результативность: онлайн пересобран": "eff_rebuild",
+    "Результативность: выдана награда": "eff_reward_issue",
+    "Результативность: награда отклонена": "eff_reward_reject",
+    "Результативность: изменены настройки": "eff_settings",
+    "Результативность: сводка сформирована автоматически": "eff_summary_auto",
+    "Результативность: сводка удалена": "eff_summary_delete",
+    "Результативность: сводка сформирована вручную": "eff_summary_manual",
+    "Результативность: варн за норму": "eff_warn_issue",
+    "Результативность: варн отклонён": "eff_warn_reject",
+    "Результативность: варн снят": "eff_warn_remove",
 }
 
 CARD_TITLE = {
@@ -128,6 +194,29 @@ CARD_TITLE = {
     "delete_vip": "Привилегия",
     "assign_permission_set": "Доступ к панели",
     "revoke_permission_set": "Доступ к панели",
+}
+
+ACTION_CATEGORIES = {
+    "Наказание": {"issue_punishment", "unpunish", "delete_punishment", "report_punish"},
+    "Админка": {"add_admin", "edit_admin", "delete_admin", "auto_remove_admin", "issue_warn", "remove_warn"},
+    "Привилегия": {"set_vip", "delete_vip"},
+    "Бейдж": {"create_badge", "update_badge", "delete_badge", "grant_badge", "revoke_badge"},
+    "Доступ к панели": {"assign_permission_set", "revoke_permission_set", "revoke_panel_access", "save_permission_set", "delete_permission_set"},
+    "Группа администраторов": {"add_admin_group", "edit_admin_group"},
+    "VIP-группа": {"add_vip_group", "edit_vip_group", "delete_vip_group"},
+    "Финансы": {"set_balance", "wipe_balance"},
+    "Levels & Ranks": {"set_lr_exp", "wipe_lr_stats"},
+    "Роль на сайте": {"set_website_role"},
+    "Промокод": {"save_promo", "enable_promo", "disable_promo", "delete_promo"},
+    "Сезон": {"save_season", "delete_season", "activate_season", "finish_season", "award_season_prize", "unaward_season_prize", "save_season_prize", "delete_season_prize"},
+    "Настройка": {"save_reason", "delete_reason", "save_duration", "delete_duration", "save_report_settings", "save_report_verdict", "delete_report_verdict"},
+    "Уведомление": {"notify", "notify_all"},
+    "Репорт": {"take_report", "resolve_report", "dismiss_report", "refuse_report", "warn_report", "delete_report", "wipe_reports", "set_cs2_report_status"},
+    "Результативность": {
+        "eff_admin_add", "eff_admin_auto_off", "eff_admin_delete", "eff_admin_edit", "eff_admin_import", "eff_admin_sync",
+        "eff_rebuild", "eff_reward_issue", "eff_reward_reject", "eff_settings", "eff_summary_auto", "eff_summary_delete",
+        "eff_summary_manual", "eff_warn_issue", "eff_warn_reject", "eff_warn_remove",
+    },
 }
 
 # Порт Services\PanelAccess::CAPABILITY_CATALOG (public/src/Services/PanelAccess.php)
@@ -207,6 +296,20 @@ CARD_COLOR = {
     "revoke_permission_set": discord.Color.red(),
 }
 
+POSITIVE_ACTIONS = {
+    "add_admin", "set_vip", "grant_badge", "assign_permission_set", "activate_season",
+    "award_season_prize", "enable_promo", "resolve_report", "eff_reward_issue",
+}
+WARNING_ACTIONS = {
+    "edit_admin", "issue_warn", "warn_report", "set_balance", "set_lr_exp", "set_website_role",
+    "update_badge", "save_promo", "save_season", "save_permission_set",
+}
+DESTRUCTIVE_ACTIONS = {
+    "issue_punishment", "delete_admin", "auto_remove_admin", "delete_vip", "revoke_badge",
+    "revoke_permission_set", "revoke_panel_access", "delete_badge", "delete_promo", "delete_season",
+    "delete_report", "wipe_reports", "wipe_balance", "wipe_lr_stats", "dismiss_report",
+}
+
 PUNISH_TYPE_LABELS = {0: "Бан", 1: "Мут", 2: "Гаг"}
 
 _TARGET_LINK_RE = re.compile(r"^\[(\d+)]\(([^)]*)\)$")
@@ -218,6 +321,53 @@ _ISSUED_PUNISHMENT_RE = re.compile(
     r"(?P<duration>\d+) сек\. Причина: (?P<reason>.+)$",
     re.IGNORECASE,
 )
+_BADGE_TARGET_RE = re.compile(r"^(?P<steam>7656119\d{10})\s+#(?P<badge>\d+)$")
+
+
+def action_card_title(action_key: str) -> str:
+    if action_key in CARD_TITLE:
+        return CARD_TITLE[action_key]
+    for title, actions in ACTION_CATEGORIES.items():
+        if action_key in actions:
+            return title
+    return "Действие в админ-панели"
+
+
+def action_card_color(action_key: str):
+    if action_key in CARD_COLOR:
+        return CARD_COLOR[action_key]
+    if action_key in DESTRUCTIVE_ACTIONS:
+        return discord.Color.red()
+    if action_key in POSITIVE_ACTIONS:
+        return discord.Color.green()
+    if action_key in WARNING_ACTIONS:
+        return discord.Color.gold()
+    if action_key.startswith("delete_") or action_key.startswith("wipe_"):
+        return discord.Color.dark_grey()
+    return discord.Color.blurple()
+
+
+def action_target_label(action_key: str) -> str:
+    title = action_card_title(action_key)
+    return {
+        "Промокод": "Промокод",
+        "Сезон": "Сезон / приз",
+        "Настройка": "Настройка",
+        "Репорт": "Репорт",
+        "Группа администраторов": "Группа",
+        "VIP-группа": "Группа",
+        "Уведомление": "Получатель",
+        "Финансы": "Пользователь",
+        "Levels & Ranks": "Игрок",
+        "Результативность": "Объект",
+    }.get(title, "Объект")
+
+
+def add_embed_field(embed, name: str, value, inline: bool = False):
+    text = str(value or "—").strip() or "—"
+    if len(text) > 1024:
+        text = text[:1021] + "…"
+    embed.add_field(name=name, value=text, inline=inline)
 
 
 def parse_target(raw: str):
@@ -464,11 +614,45 @@ async def fetch_permission_set_context(steamid64: str):
     return {"name": set_name, "capabilities": capabilities_text}
 
 
+async def fetch_badge_context(badge_id: int, steamid64: str = None):
+    """Название бейджа и срок ручной выдачи. Каталог остаётся доступен и
+    после снятия бейджа у игрока, поэтому название показывается в обоих логах."""
+    if bot.db_pool is None:
+        return None
+    try:
+        async with bot.db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT label FROM profile_badges WHERE id = %s LIMIT 1", (badge_id,))
+                row = await cur.fetchone()
+                label = row[0] if row and row[0] else f"ID {badge_id}"
+                duration = None
+                if steamid64:
+                    await cur.execute(
+                        "SELECT expires FROM profile_badge_players WHERE badge_id = %s AND steamid64 = %s LIMIT 1",
+                        (badge_id, steamid64),
+                    )
+                    grant = await cur.fetchone()
+                    if grant is not None:
+                        expires = int(grant[0] or 0)
+                        duration = "Навсегда" if expires == 0 else humanize_duration(max(0, expires - int(time.time())))
+                return {"label": label, "duration": duration}
+    except Exception:
+        log.exception("admin-log: не удалось получить бейдж %s", badge_id)
+        return None
+
+
 async def build_action_embed(action_key: str, action_label: str, target_raw: str, details: str, admin_label: str):
-    """None означает "нет карточки под это действие или не хватило данных" —
-    вызывающая сторона в этом случае шлёт старый общий embed."""
+    """Единая тематическая карточка для любого известного действия панели."""
     steamid64, profile_url = parse_target(target_raw)
     punishment_context = None
+    badge_id = None
+    badge_match = _BADGE_TARGET_RE.match((target_raw or "").strip())
+    if badge_match:
+        steamid64 = badge_match.group("steam")
+        profile_url = f"{SITE_URL}/profile/{steamid64}"
+        badge_id = int(badge_match.group("badge"))
+    elif action_key in ("create_badge", "update_badge", "delete_badge") and (target_raw or "").strip().isdigit():
+        badge_id = int(target_raw.strip())
 
     if action_key in ("issue_punishment", "unpunish", "delete_punishment"):
         if steamid64:
@@ -489,62 +673,78 @@ async def build_action_embed(action_key: str, action_label: str, target_raw: str
             steamid64 = str(STEAMID64_BASE + int(stripped))
             profile_url = f"{SITE_URL}/profile/{steamid64}"
 
-    if steamid64 is None:
-        return None
-
-    name, avatar, resolved_profile_url = await fetch_player_profile(steamid64)
-    profile_url = profile_url or resolved_profile_url
-
     embed = discord.Embed(
-        title=CARD_TITLE.get(action_key, "Действие в админ-панели"),
-        color=CARD_COLOR.get(action_key, discord.Color.blurple()),
+        title=action_card_title(action_key),
+        color=action_card_color(action_key),
     )
-    embed.add_field(name="Игрок", value=f"[{name}]({profile_url})" if profile_url else name, inline=True)
-    embed.add_field(name="Действие", value=action_label, inline=True)
-    if avatar:
-        embed.set_thumbnail(url=avatar)
+    if steamid64:
+        name, avatar, resolved_profile_url = await fetch_player_profile(steamid64)
+        profile_url = profile_url or resolved_profile_url
+        add_embed_field(embed, "Игрок", f"[{name}]({profile_url})" if profile_url else name, inline=True)
+        if avatar:
+            embed.set_thumbnail(url=avatar)
+    elif target_raw and badge_id is None:
+        add_embed_field(embed, action_target_label(action_key), target_raw, inline=True)
+    add_embed_field(embed, "Действие", action_label, inline=True)
+
+    details_consumed = False
 
     if action_key == "issue_punishment":
         embed.add_field(name="Игра", value="CS2", inline=False)
         context = punishment_context or parse_issued_punishment(details)
         if context:
-            embed.add_field(name="Тип наказания", value=context["type"], inline=True)
-            embed.add_field(name="Причина", value=context["reason"], inline=True)
-            embed.add_field(name="Срок наказания", value=context["duration"], inline=True)
+            add_embed_field(embed, "Тип наказания", context["type"], inline=True)
+            add_embed_field(embed, "Причина", context["reason"], inline=True)
+            add_embed_field(embed, "Срок наказания", context["duration"], inline=True)
             if context.get("server"):
-                embed.add_field(name="Сервера", value=context["server"], inline=True)
+                add_embed_field(embed, "Сервера", context["server"], inline=True)
+            details_consumed = True
     elif action_key in ("unpunish", "delete_punishment"):
         embed.add_field(name="Игра", value="CS2", inline=False)
         if punishment_context:
-            embed.add_field(name="Тип наказания", value=punishment_context["type"], inline=True)
-            embed.add_field(name="Причина", value=punishment_context["reason"], inline=True)
+            add_embed_field(embed, "Тип наказания", punishment_context["type"], inline=True)
+            add_embed_field(embed, "Причина", punishment_context["reason"], inline=True)
+            details_consumed = True
     elif action_key in ("add_admin", "edit_admin"):
         embed.add_field(name="Игра", value="CS2", inline=False)
         context = await fetch_admin_context(steamid64, details)
         if context["group"]:
-            embed.add_field(name="Группа", value=context["group"], inline=True)
-        embed.add_field(name="Сервера", value=context["server"], inline=True)
+            add_embed_field(embed, "Группа", context["group"], inline=True)
+        add_embed_field(embed, "Сервера", context["server"], inline=True)
         if context["duration"]:
-            embed.add_field(name="Срок", value=context["duration"], inline=True)
+            add_embed_field(embed, "Срок", context["duration"], inline=True)
+        details_consumed = True
     elif action_key in ("delete_admin", "auto_remove_admin"):
         embed.add_field(name="Игра", value="CS2", inline=False)
         if action_key == "auto_remove_admin" and details:
-            embed.add_field(name="Причина", value=details, inline=False)
+            add_embed_field(embed, "Причина", details)
+            details_consumed = True
     elif action_key == "set_vip":
         context = await fetch_vip_context(details)
         if context:
-            embed.add_field(name="Группа", value=context["group"], inline=True)
-            embed.add_field(name="Сервера", value=context["server"], inline=True)
-            embed.add_field(name="Срок", value=context["duration"], inline=True)
+            add_embed_field(embed, "Группа", context["group"], inline=True)
+            add_embed_field(embed, "Сервера", context["server"], inline=True)
+            add_embed_field(embed, "Срок", context["duration"], inline=True)
+            details_consumed = True
     # delete_vip: данных для доп. полей нет (строка в vip_users уже удалена
     # к моменту, когда сайт шлёт этот вебхук) — карточка остаётся минимальной.
-    elif action_key in ("assign_permission_set", "revoke_permission_set"):
+    elif action_key in ("assign_permission_set", "revoke_permission_set", "revoke_panel_access"):
         context = await fetch_permission_set_context(steamid64)
         if context:
-            embed.add_field(name="Набор доступа", value=context["name"], inline=True)
-            embed.add_field(name="Права доступа", value=context["capabilities"], inline=False)
+            add_embed_field(embed, "Набор доступа", context["name"], inline=True)
+            add_embed_field(embed, "Права доступа", context["capabilities"])
+            details_consumed = True
+    elif action_key in ("create_badge", "update_badge", "delete_badge", "grant_badge", "revoke_badge") and badge_id is not None:
+        context = await fetch_badge_context(badge_id, steamid64)
+        add_embed_field(embed, "Бейдж", context["label"] if context else f"ID {badge_id}", inline=True)
+        if context and context["duration"] and action_key == "grant_badge":
+            add_embed_field(embed, "Срок", context["duration"], inline=True)
+        details_consumed = True
 
-    embed.add_field(name="Кем", value=admin_label, inline=False)
+    if details and not details_consumed:
+        add_embed_field(embed, "Подробности", details)
+
+    add_embed_field(embed, "Кем", admin_label)
     return embed
 
 
