@@ -58,6 +58,7 @@ GUILD_OBJECT = discord.Object(id=GUILD_ID)
 
 _STEAM_LEGACY_RE = re.compile(r"^STEAM_[0-5]:([01]):(\d+)$", re.IGNORECASE)
 _STEAM64_RE = re.compile(r"^7656119\d{10}$")
+_STEAM3_RE = re.compile(r"^\[U:[01]:(\d+)]$", re.IGNORECASE)
 
 
 def normalize_steamid64(steamid: str):
@@ -69,6 +70,9 @@ def normalize_steamid64(steamid: str):
     m = _STEAM_LEGACY_RE.match(steamid)
     if m:
         return str(STEAMID64_BASE + int(m.group(2)) * 2 + int(m.group(1)))
+    m = _STEAM3_RE.match(steamid)
+    if m:
+        return str(STEAMID64_BASE + int(m.group(1)))
     return None
 
 
@@ -208,6 +212,12 @@ PUNISH_TYPE_LABELS = {0: "Бан", 1: "Мут", 2: "Гаг"}
 _TARGET_LINK_RE = re.compile(r"^\[(\d+)]\(([^)]*)\)$")
 _ADMIN_DETAILS_RE = re.compile(r"^Группа: (?P<group>.+), серверы: (?P<servers>.+)$")
 _VIP_DETAILS_RE = re.compile(r"^VIP-группа (?P<group>\S+), сервер (?P<server>-?\d+), срок (?P<duration>\d+) сек\.")
+_PUNISHMENT_ID_RE = re.compile(r"(?:наказани[ея]|запись наказания) ID (?P<id>\d+)", re.IGNORECASE)
+_ISSUED_PUNISHMENT_RE = re.compile(
+    r"^Выдан (?P<type>Бан|Мут|Гаг) игроку (?P<name>.+) на "
+    r"(?P<duration>\d+) сек\. Причина: (?P<reason>.+)$",
+    re.IGNORECASE,
+)
 
 
 def parse_target(raw: str):
@@ -264,22 +274,52 @@ async def fetch_player_profile(steamid64: str):
     return name, avatar, profile_url
 
 
-async def fetch_punishment_context(steamid64: str):
+def parse_punishment_id(details: str):
+    match = _PUNISHMENT_ID_RE.search(details or "")
+    return int(match.group("id")) if match else None
+
+
+def parse_issued_punishment(details: str):
+    """Резервный источник данных, если БД бота временно недоступна."""
+    match = _ISSUED_PUNISHMENT_RE.match(details or "")
+    if not match:
+        return None
+    seconds = int(match.group("duration"))
+    return {
+        "type": match.group("type").capitalize(),
+        "reason": match.group("reason"),
+        "duration": humanize_duration(seconds),
+        "server": None,
+        "steamid64": None,
+        "name": match.group("name"),
+    }
+
+
+async def fetch_punishment_context(steamid64: str = None, punishment_id: int = None):
     """Тип/причина/срок/сервер последнего наказания игрока — читается из
     as_punishments напрямую, а не парсится из текста details, чтобы не
     зависеть от формулировок на стороне сайта."""
     if bot.db_pool is None:
         return None
     try:
-        formats = steamid_all_formats(steamid64)
-        placeholders = ",".join(["%s"] * len(formats))
         async with bot.db_pool.acquire() as conn:
             async with conn.cursor(aiomysql.DictCursor) as cur:
-                await cur.execute(
-                    "SELECT punish_type, reason, datestart, expires, server_id FROM as_punishments "
-                    f"WHERE steamid IN ({placeholders}) ORDER BY id DESC LIMIT 1",
-                    formats,
-                )
+                if punishment_id is not None:
+                    await cur.execute(
+                        "SELECT id, name, steamid, punish_type, reason, created, expires, server_id "
+                        "FROM as_punishments WHERE id = %s LIMIT 1",
+                        (punishment_id,),
+                    )
+                elif steamid64:
+                    formats = steamid_all_formats(steamid64)
+                    placeholders = ",".join(["%s"] * len(formats))
+                    await cur.execute(
+                        "SELECT id, name, steamid, punish_type, reason, created, expires, server_id "
+                        f"FROM as_punishments WHERE steamid IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+                        formats,
+                    )
+                else:
+                    return None
                 row = await cur.fetchone()
                 if not row:
                     return None
@@ -292,13 +332,15 @@ async def fetch_punishment_context(steamid64: str):
                         server_name = srow["name"]
                 punish_type = int(row.get("punish_type") or 0)
                 expires = int(row.get("expires") or 0)
-                datestart = int(row.get("datestart") or 0)
-                duration_text = "Навсегда" if expires == 0 else humanize_duration(max(0, expires - datestart))
+                created = int(row.get("created") or 0)
+                duration_text = "Навсегда" if expires == 0 else humanize_duration(max(0, expires - created))
                 return {
                     "type": PUNISH_TYPE_LABELS.get(punish_type, "Наказание"),
                     "reason": row.get("reason") or "—",
                     "duration": duration_text,
                     "server": server_name,
+                    "steamid64": normalize_steamid64(str(row.get("steamid") or "")),
+                    "name": row.get("name") or None,
                 }
     except Exception:
         log.exception("admin-log: не удалось получить наказание для %s", steamid64)
@@ -426,6 +468,18 @@ async def build_action_embed(action_key: str, action_label: str, target_raw: str
     """None означает "нет карточки под это действие или не хватило данных" —
     вызывающая сторона в этом случае шлёт старый общий embed."""
     steamid64, profile_url = parse_target(target_raw)
+    punishment_context = None
+
+    if action_key in ("issue_punishment", "unpunish", "delete_punishment"):
+        if steamid64:
+            punishment_context = await fetch_punishment_context(steamid64=steamid64)
+        else:
+            punishment_id = parse_punishment_id(details)
+            if punishment_id is not None:
+                punishment_context = await fetch_punishment_context(punishment_id=punishment_id)
+                if punishment_context and punishment_context.get("steamid64"):
+                    steamid64 = punishment_context["steamid64"]
+                    profile_url = f"{SITE_URL}/profile/{steamid64}"
 
     # DELETE_VIP шлёт vip_users.account_id, а не steamid — это единственное
     # действие, где target не steamid ни в каком виде.
@@ -452,14 +506,18 @@ async def build_action_embed(action_key: str, action_label: str, target_raw: str
 
     if action_key == "issue_punishment":
         embed.add_field(name="Игра", value="CS2", inline=False)
-        context = await fetch_punishment_context(steamid64)
+        context = punishment_context or parse_issued_punishment(details)
         if context:
             embed.add_field(name="Тип наказания", value=context["type"], inline=True)
             embed.add_field(name="Причина", value=context["reason"], inline=True)
             embed.add_field(name="Срок наказания", value=context["duration"], inline=True)
-            embed.add_field(name="Сервера", value=context["server"], inline=True)
+            if context.get("server"):
+                embed.add_field(name="Сервера", value=context["server"], inline=True)
     elif action_key in ("unpunish", "delete_punishment"):
         embed.add_field(name="Игра", value="CS2", inline=False)
+        if punishment_context:
+            embed.add_field(name="Тип наказания", value=punishment_context["type"], inline=True)
+            embed.add_field(name="Причина", value=punishment_context["reason"], inline=True)
     elif action_key in ("add_admin", "edit_admin"):
         embed.add_field(name="Игра", value="CS2", inline=False)
         context = await fetch_admin_context(steamid64, details)
