@@ -751,14 +751,15 @@ async def build_action_embed(action_key: str, action_label: str, target_raw: str
 def load_role_mapping() -> dict:
     """Читает ROLE_MAPPING_FILE: {"admin_groups": {"Название AS-группы": "discord_role_id"},
     "vip_groups": {"group_key": "discord_role_id"},
-    "faceit_levels": {"1": "discord_role_id", ..., "10": "discord_role_id"}}.
+    "faceit_levels": {"1": "discord_role_id", ..., "10": "discord_role_id"},
+    "punishment_roles": {"active": "discord_role_id"}}.
     Ключи должны совпадать с
     as_groups.name (Админ-панель → Настройки → Админ-группы, AdminSystem для CS2)
     и admin_vip_groups.group_key (VIPCore groups.ini) соответственно — файл
     перечитывается на каждом тике, перезапуск бота не нужен. Значением может быть
     один ID роли или список ID (["111", "222"]), если группе нужно выдавать
     сразу несколько ролей в Discord."""
-    empty = {"admin_groups": {}, "vip_groups": {}, "faceit_levels": {}}
+    empty = {"admin_groups": {}, "vip_groups": {}, "faceit_levels": {}, "punishment_roles": {}}
     try:
         # utf-8-sig проглатывает BOM, который некоторые редакторы (в т.ч. на
         # хостингах) молча добавляют в начало файла и который иначе ломает
@@ -767,7 +768,7 @@ def load_role_mapping() -> dict:
             data = json.load(f)
     except FileNotFoundError:
         log.warning(
-            "%s не найден — роли администратора/VIP/FACEIT синхронизироваться не будут "
+            "%s не найден — настроенные роли синхронизироваться не будут "
             "(проверьте, что файл загружен на хостинг рядом с bot.py)",
             ROLE_MAPPING_FILE,
         )
@@ -790,6 +791,9 @@ def load_role_mapping() -> dict:
             if section == "faceit_levels" and key not in {str(level) for level in range(1, 11)}:
                 log.warning("Некорректный уровень FACEIT в %s: %r (ожидается 1–10)", ROLE_MAPPING_FILE, key)
                 continue
+            if section == "punishment_roles" and key != "active":
+                log.warning("Некорректный ключ наказаний в %s: %r (ожидается active)", ROLE_MAPPING_FILE, key)
+                continue
             values = raw_value if isinstance(raw_value, list) else [raw_value]
             role_ids = set()
             for value in values:
@@ -808,6 +812,7 @@ def load_role_mapping() -> dict:
         "admin_groups": to_role_id_map("admin_groups"),
         "vip_groups": to_role_id_map("vip_groups"),
         "faceit_levels": to_role_id_map("faceit_levels"),
+        "punishment_roles": to_role_id_map("punishment_roles"),
     }
 
 
@@ -992,7 +997,9 @@ class LinkBot(commands.Bot):
             await self.db_pool.wait_closed()
         await super().close()
 
-    async def _load_role_state(self, admin_role_map: dict, vip_role_map: dict, faceit_role_map: dict):
+    async def _load_role_state(
+        self, admin_role_map: dict, vip_role_map: dict, faceit_role_map: dict, punishment_role_ids=None,
+    ):
         """Один общий снимок из БД — используется и часовым циклом, и мгновенной
         синхронизацией по вебхуку, чтобы логика не расходилась в двух местах."""
         async with self.db_pool.acquire() as conn:
@@ -1048,17 +1055,46 @@ class LinkBot(commands.Bot):
                         faceit_levels_by_steamid64.clear()
                         log.exception("Кэш FACEIT недоступен; проверьте миграцию 010 и SELECT на faceit_profiles")
 
-        return linked_rows, admin_groups_by_steamid64, vip_groups_by_account_id, faceit_levels_by_steamid64
+                punished_steamids = set()
+                if punishment_role_ids:
+                    try:
+                        # Те же условия активности, что в profile.php / admin_api.php.
+                        # Любой тип наказания на любом сервере проекта; SteamID
+                        # нормализуем, поскольку AdminSystem пишет разные форматы.
+                        await cur.execute(
+                            "SELECT DISTINCT steamid FROM as_punishments "
+                            "WHERE (expires = 0 OR expires > UNIX_TIMESTAMP()) "
+                            "AND (unpunish_admin_id IS NULL OR unpunish_admin_id = 0)"
+                        )
+                        for (raw_steamid,) in await cur.fetchall():
+                            steamid64 = normalize_steamid64(str(raw_steamid or ""))
+                            if steamid64:
+                                punished_steamids.add(steamid64)
+                    except aiomysql.MySQLError:
+                        # None = состояние неизвестно; текущую роль сохраняем.
+                        punished_steamids = None
+                        log.exception("Наказания недоступны; проверьте SELECT на as_punishments")
+
+        return (
+            linked_rows, admin_groups_by_steamid64, vip_groups_by_account_id,
+            faceit_levels_by_steamid64, punished_steamids,
+        )
 
     @staticmethod
     def _desired_managed_roles(
         steamid64, admin_role_map: dict, vip_role_map: dict, admin_groups_by_steamid64: dict,
         vip_groups_by_account_id: dict, faceit_role_map: dict, faceit_levels_by_steamid64: dict,
-        current_role_ids: set,
+        current_role_ids: set, punishment_role_ids=None, punished_steamids=None,
     ) -> set:
         desired = set()
         if not steamid64:
             return desired
+
+        if punishment_role_ids:
+            if punished_steamids is None:
+                desired |= current_role_ids & punishment_role_ids
+            elif steamid64 in punished_steamids:
+                desired |= punishment_role_ids
 
         for group_name in admin_groups_by_steamid64.get(steamid64, ()):
             desired |= admin_role_map.get(group_name, set())
@@ -1112,9 +1148,9 @@ class LinkBot(commands.Bot):
 
         try:
             if to_add:
-                await member.add_roles(*to_add, reason="Синхронизация роли/VIP/уровня FACEIT с сайтом")
+                await member.add_roles(*to_add, reason="Синхронизация ролей с сайтом")
             if to_remove:
-                await member.remove_roles(*to_remove, reason="Роль/VIP/уровень FACEIT на сайте изменились")
+                await member.remove_roles(*to_remove, reason="Роль/VIP/уровень FACEIT/наказание на сайте изменились")
         except discord.HTTPException as e:
             log.warning("Не удалось синхронизировать роли для %s: %s", member, e)
 
@@ -1123,6 +1159,7 @@ class LinkBot(commands.Bot):
         admin_role_map = role_mapping["admin_groups"]
         vip_role_map = role_mapping["vip_groups"]
         faceit_role_map = role_mapping["faceit_levels"]
+        punishment_role_ids = role_mapping["punishment_roles"].get("active", set())
         # Роли, которыми бот управляет сам — их можно снимать, если участник
         # больше не подпадает ни под один маппинг; остальные роли не трогаем.
         managed_role_ids = set()
@@ -1132,7 +1169,8 @@ class LinkBot(commands.Bot):
             managed_role_ids |= role_ids
         for role_ids in faceit_role_map.values():
             managed_role_ids |= role_ids
-        return admin_role_map, vip_role_map, faceit_role_map, managed_role_ids
+        managed_role_ids |= punishment_role_ids
+        return admin_role_map, vip_role_map, faceit_role_map, punishment_role_ids, managed_role_ids
 
     async def sync_member_now(self, discord_id: str):
         """Мгновенная синхронизация одного участника — дёргается сайтом сразу
@@ -1157,11 +1195,11 @@ class LinkBot(commands.Bot):
                 log.warning("sync_member_now: не удалось получить участника %s: %s", discord_id, e)
                 return
 
-        admin_role_map, vip_role_map, faceit_role_map, managed_role_ids = self._load_role_mapping_and_managed_ids()
+        admin_role_map, vip_role_map, faceit_role_map, punishment_role_ids, managed_role_ids = self._load_role_mapping_and_managed_ids()
 
         try:
-            linked_rows, admin_groups_by_steamid64, vip_groups_by_account_id, faceit_levels_by_steamid64 = await self._load_role_state(
-                admin_role_map, vip_role_map, faceit_role_map
+            linked_rows, admin_groups_by_steamid64, vip_groups_by_account_id, faceit_levels_by_steamid64, punished_steamids = await self._load_role_state(
+                admin_role_map, vip_role_map, faceit_role_map, punishment_role_ids
             )
         except Exception:
             log.exception("sync_member_now: не удалось загрузить данные из БД")
@@ -1173,6 +1211,7 @@ class LinkBot(commands.Bot):
         desired = self._desired_managed_roles(
             steamid64, admin_role_map, vip_role_map, admin_groups_by_steamid64, vip_groups_by_account_id,
             faceit_role_map, faceit_levels_by_steamid64, {role.id for role in member.roles},
+            punishment_role_ids, punished_steamids,
         )
         await self._sync_member(guild, member, verified_role, is_linked, managed_role_ids, desired)
         log.info("sync_member_now: синхронизировал роли для %s", member)
@@ -1187,11 +1226,11 @@ class LinkBot(commands.Bot):
             log.warning("VERIFIED_ROLE_ID %s not found in guild %s", VERIFIED_ROLE_ID, GUILD_ID)
             return
 
-        admin_role_map, vip_role_map, faceit_role_map, managed_role_ids = self._load_role_mapping_and_managed_ids()
+        admin_role_map, vip_role_map, faceit_role_map, punishment_role_ids, managed_role_ids = self._load_role_mapping_and_managed_ids()
 
         try:
-            linked_rows, admin_groups_by_steamid64, vip_groups_by_account_id, faceit_levels_by_steamid64 = await self._load_role_state(
-                admin_role_map, vip_role_map, faceit_role_map
+            linked_rows, admin_groups_by_steamid64, vip_groups_by_account_id, faceit_levels_by_steamid64, punished_steamids = await self._load_role_state(
+                admin_role_map, vip_role_map, faceit_role_map, punishment_role_ids
             )
         except Exception:
             # Раньше исключение здесь (обрыв соединения с БД и т.п.) вылетало из
@@ -1212,6 +1251,7 @@ class LinkBot(commands.Bot):
             desired = self._desired_managed_roles(
                 steamid64, admin_role_map, vip_role_map, admin_groups_by_steamid64, vip_groups_by_account_id,
                 faceit_role_map, faceit_levels_by_steamid64, {role.id for role in member.roles},
+                punishment_role_ids, punished_steamids,
             )
             try:
                 await self._sync_member(guild, member, verified_role, is_linked, managed_role_ids, desired)
